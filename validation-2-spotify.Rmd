@@ -1,0 +1,473 @@
+---
+title: "Data Mining Spotify"
+author: "Pablo Bello"
+date: "5/22/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+require(dplyr)
+require(rsample)
+require(recipes)
+require(parsnip)
+require(tune)
+require(dials)
+require(workflows)
+require(yardstick)
+require(knitr)
+require(kableExtra)
+require(xgboost)
+require(ggplot2)
+require(data.table)
+
+```
+
+
+
+```{r}
+##### PACKAGES #####
+library(tidyverse)
+library(Rspotify)
+library(magrittr)
+library(plotROC) #---for ROC curveswith ggplot
+library(viridis)
+library(hrbrthemes)
+library(GGally)
+library(ggrepel)
+
+
+
+#---tidymodels---# (issues with installation as a suite of packages)
+library(rsample)
+library(recipes)
+library(parsnip)
+library(yardstick)
+library(workflows)
+library(tune)
+library(hardhat)
+library(ranger)
+library(caret)
+
+##### DATA #####
+load("~/Desktop/Spotify/Data/spotify_data.RData")
+load("~/Desktop/Spotify/Data/train_test_data.RData")
+
+```
+
+
+```{r}
+##### DESCRIPTION OF THE TRAINING/TEST DATASET #####
+
+
+#--- Figure 1 in the paper ---#
+genres %>% 
+  select(-key, -mode) %>%  #Include only numeric variables
+  pivot_longer(cols = danceability:duration_ms, names_to = "metric", values_to = "value") %>% 
+  ggplot (aes (value, fill = genre, color = genre)) +
+  geom_density (alpha = 0.6) +
+  labs (title = "Figure 1. Description of the train/test dataset",
+        x = "Value",
+        y = "Density",
+        fill = "Genre", 
+        color = "Genre") +
+  facet_wrap(~ metric, scales = "free") +
+  scale_fill_viridis(discrete = TRUE) +
+  scale_color_viridis(discrete = TRUE) +
+  theme_minimal(base_family = "Times")
+
+
+#--- More clear plotting of the distribution of instrumentalness.
+instrument <- 
+  genres %>% 
+  filter  (instrumentalness > 0.001) %>% 
+ggplot(aes(instrumentalness , fill = genre)) +
+  geom_density (alpha = 0.8) 
+ 
+
+
+```
+
+
+
+
+
+```{r}
+
+##### Split into train/test #####
+set.seed(61295)
+
+genres_split <- initial_split(genres, prop = 3/4)
+
+#---Extract the train and test datasets
+genres_train <- training(genres_split)
+genres_test <- testing(genres_split)
+
+#---Create cross-validation object from training data
+genres_cv <- vfold_cv(genres_train)
+
+##### Define The recipe #####
+genres_recipe <- 
+  # which consists of the formula (outcome ~ predictors)
+recipe(genre ~ duration_ms + danceability + energy + loudness + speechiness + acousticness + instrumentalness + liveness + valence + tempo 
+       #+ key + mode
+       , data = genres) %>%
+  # and some pre-processing steps
+  step_normalize(all_numeric()) %>%
+  step_knnimpute(all_predictors()) #K-nearest-neighbor imputation
+
+##### Specify the model ######
+rf_model <- 
+  # specify that the model is a random forest
+  rand_forest() %>% 
+   # specify that the `mtry` parameter needs to be tuned
+  set_args(mtry = tune()) %>%
+  # select the engine/package that underlies the model
+  set_engine("ranger", importance = "impurity") %>%
+  # choose either the continuous regression or binary classification mode
+  set_mode("classification") 
+
+##### Put it all together in a workflow #####
+
+# set the workflow
+rf_workflow <- workflow() %>%
+  # add the recipe
+  add_recipe(genres_recipe) %>%
+  # add the model
+  add_model(rf_model)
+
+##### Tune the parameters #####
+# specify which values want to try
+rf_grid <- expand.grid(mtry = c(seq (2,9,1)))
+# extract results
+ rf_tune_results <- 
+  rf_workflow %>%
+  tune_grid(resamples = genres_cv, #CV object
+          grid = rf_grid, # grid of values to try
+          metrics = metric_set(accuracy, roc_auc)) # metrics we care about
+           
+#--- Results
+ rf_tune_results %>%
+ collect_metrics()
+
+#--- Choose the best parameter for mtry 
+param_final <- rf_tune_results %>%
+  select_best(metric = "accuracy")
+#--- Include it in the workflow
+rf_workflow <- rf_workflow %>%
+  finalize_workflow(param_final)
+ 
+
+
+##### Evaluate the model on the test set #####
+rf_fit <- rf_workflow %>%
+  # fit on the training set and evaluate on test set
+  last_fit(genres_split)
+
+test_performance <- rf_fit %>% collect_metrics()
+test_performance
+test_predictions <- rf_fit %>% collect_predictions()
+test_predictions 
+
+(cm <- confusionMatrix(data = test_predictions$.pred_class, reference = test_predictions$genre))
+
+```
+
+
+```{r}
+########### XGBOOST ########### 
+set.seed(061295)
+
+# XGBoost model specification
+xg_model<-parsnip::boost_tree(
+  mode = "classification"
+  # ,trees = 1000, #nrounds
+  # learn_rate = tune(), #eta
+  # sample_size = tune(), #subsample
+  # tree_depth = tune() #max_depth
+) %>%
+  set_engine("xgboost", objective = "multi:softprob")
+
+# xg_params <- dials::parameters(
+#   tree_depth(),
+#   learn_rate(),
+#   sample_size = sample_prop(c(0.4, 0.9))
+# )
+
+# Parameter grid
+# xg_grid <- dials::grid_max_entropy(xg_params, size = 5)
+
+
+# set the workflow
+xg_workflow <- workflow() %>%
+  # add the recipe
+  add_recipe(genres_recipe) %>%
+  # add the model
+  add_model(xg_model)
+
+
+# xg_tune_results <- 
+#   xg_workflow %>%
+#   tune_grid(resamples = genres_cv, #CV object
+#           grid = xg_grid, # grid of values to try
+#           metrics = metric_set(accuracy, roc_auc)) # metrics we care about
+
+
+# #--- Results
+#  xg_tune_results %>%
+#  collect_metrics()
+# 
+# #--- Choose the best parameter for mtry 
+# param_final <- xg_tune_results %>%
+#   select_best(metric = "accuracy")
+# #--- Include it in the workflow
+# xg_workflow <- xg_workflow %>%
+#   finalize_workflow(param_final)
+
+xg_fit <- xg_workflow %>% 
+  last_fit(genres_split)
+
+test_performance <- xg_fit %>% collect_metrics()
+test_performance
+
+test_predictions <- xg_fit %>% collect_predictions()
+test_predictions 
+
+(cm <- confusionMatrix(data = test_predictions$.pred_class, reference = test_predictions$genre))
+```
+
+
+```{r}
+##### PREDICTIONS AND VARIABLE IMPORTANCE #####
+#
+final_model <- fit(rf_workflow, genres)
+
+#---Keep only unique songs 
+predictions <- spotify_data %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  drop_na(danceability:duration_ms)
+
+#---Do the predictions
+predictions %<>%  
+   bind_cols (predict(final_model, new_data = predictions )) %>% 
+   select(id , .pred_class) 
+
+
+ ##### Variable Importance #####
+ranger_obj <- pull_workflow_fit(final_model)$fit
+sort (ranger_obj$variable.importance, decreasing = TRUE)
+
+```
+
+
+``` {r}
+#---Merge the datasets and clean the data
+spotify <- spotify_data %>%  
+  drop_na(danceability:duration_ms) %>% 
+  left_join(predictions, by = "id") %>% 
+  mutate (pred_class = .pred_class,
+          date = as.Date(date),
+          country = fct_recode(country,
+                               "UK" = "United Kingdom of Great Britain and Northern Ireland (the)",
+                               "US" = "United States of America (the)")) %>% 
+  select (-time_signature , -key , -mode,)
+
+```
+
+```{r}
+##### PLOT  #####
+
+evolution_genres <- spotify %>%
+  group_by(country, date)%>% 
+  count(pred_class) %>% 
+  mutate (perc = n / sum(n)) 
+
+#--- Figure 2 in the paper ---# (has to be opened in a separate window to be visible)
+(plot_evo_genres <-  ggplot(evolution_genres, aes(date, perc , fill = pred_class)) +
+  geom_area(alpha=0.8 , size=.05, colour="white") +
+  theme (axis.text.x = element_blank()) +
+  scale_fill_viridis(discrete = TRUE) +
+  labs (
+    title = "Figure 2. Popularity of musical genres by country (2017 - 2020)",
+    x = "",
+    y = "",
+    fill = "Genre"
+        )  +
+  theme_ipsum(base_family = "Times",
+              plot_title_size = 12,
+              plot_title_face = "plain") + 
+  facet_wrap(~ country))
+
+```
+
+
+```{r}
+##### WHICH COUNTRIES ARE SIMILAR IN THEIR DOMINANT MUSIC CULTURES? (CLUSTERING) #####
+library(FactoMineR) # Issues with ggrepel
+library(factoextra) # Issues with ggrepel
+library(cluster)
+library(explor)
+library(WVPlots)
+#####################
+#--- Prepare the data for clustering ---#
+clusters_data <- spotify %>% 
+  group_by(country)%>% 
+  summarise_at(vars(danceability:duration_ms),mean) %>% 
+  mutate_at(vars(danceability:duration_ms) , scale)
+
+#--- Dataframe for kmeans ---#
+clusters_numeric <- clusters_data %>% select (-country)
+clusters_numeric <- as.data.frame(clusters_numeric)
+rownames (clusters_numeric) <- clusters_data$country
+
+
+
+##### K-MEANS #####
+set.seed(61295)
+###### Optimal number of clusters
+(kmeans_sil <- fviz_nbclust(clusters_numeric,kmeans, method = c("silhouette")) +
+  labs (subtitle = "Silhouette Method")) 
+
+(kmeans_gap <- fviz_nbclust(clusters_numeric, kmeans, method = c("gap")) +
+    labs (subtitle = "Gap Method"))
+(kmeans_elbow <- fviz_nbclust(clusters_numeric, kmeans, method = "wss") +
+  labs(subtitle = "Elbow method"))
+#--- The silouette method suggets two clusters and the gap method 4. There is no clear elbow.
+
+##### Kmeans with 2 and 4 clusters 
+spotify_kmeans_2 <- kmeans(scale(clusters_numeric), centers = 2)
+spotify_kmeans_4 <- kmeans(scale(clusters_numeric), centers = 4)
+########## plots for kmeans with 2 and 4 clusters
+fviz_cluster(spotify_kmeans_2, data = clusters_numeric, ggtheme=theme_classic(), repel = TRUE) 
+fviz_cluster(spotify_kmeans_4, data = clusters_numeric, ggtheme=theme_classic(), repel = TRUE)
+
+
+##### K-MEDOIDS #####
+###### Optimal number of clusters
+(pam_sil <- fviz_nbclust(clusters_numeric,pam, method = c("silhouette"))) # ---- 2 clusters
+(pam_gap <- fviz_nbclust(clusters_numeric, pam, method = c("gap"))) #--- 9 clusters
+(pam_elbow <- fviz_nbclust(clusters_numeric, pam, method = c("wss"))) # --- No clear elbow
+
+##### K-Medoids for 2 and 9
+spotify_pam_2 <- pam(clusters_numeric, k = 2, metric = "euclidean")
+spotify_pam_9 <- pam(clusters_numeric, k = 9, metric = "euclidean")
+##### Plots 
+fviz_cluster(spotify_pam_2, data = clusters_numeric, ggtheme=theme_classic(), repel = TRUE)
+fviz_cluster(spotify_pam_9, data = clusters_numeric, ggtheme=theme_classic(), repel = TRUE)
+##### Silhouette
+fviz_silhouette(spotify_pam_2, palette = "jco", ggtheme = theme_classic(), title="PAM")
+fviz_silhouette(spotify_pam_9, palette = "jco", ggtheme = theme_classic(), title="PAM")
+
+```
+
+``` {r}
+##### HIERARCHICAL CLUSTERING #####
+#---Distance Matrix
+spotify_dist <- dist(clusters_numeric, method="euclidean") 
+#---H. Clustering with Ward method (minimum variance)
+spotify_ward <- hclust(d = spotify_dist, method = "ward.D2")
+
+#---Dendogram (figure 3 in the paper) ---#
+(dendo_plot<- fviz_dend(spotify_ward, cex = 0.5, k = 4, horiz = TRUE, ggtheme = theme_classic(base_family = "Times")) +
+  labs (title = "Figure 3. Hierarchical Clustering",
+        subtitle = "Ward method"))
+
+#---Assigning the cluster number
+clusters_ward <- cutree(spotify_ward, 4)
+
+##### Clustering Evaluation #####
+fviz_dist(dist(clusters_numeric))
+
+#--- Figure 4 in the paper ---#
+(pca_plot <- fviz_cluster(object = list (data = clusters_numeric, cluster = clusters_ward),
+             repel = TRUE,
+             geom = "text",
+             main =  "Figure 4. Results of hierarchical clustering over PCA axis",
+             subtitle = "Ward Method") +
+  theme_bw(base_family = "Times"))
+
+
+```
+
+```{r}
+##### Pairwise correlation plots #####
+#--- Using the results of hierarchical clustering
+clusters_data_2 <- clusters_data %>% 
+  bind_cols (cluster = factor (clusters_ward))
+  
+PairPlot(clusters_data_2, 
+         colnames(clusters_data_2)[2:11],
+         title = "",
+         alpha = 0.8,
+         group_var = "cluster",palette = NULL)
+
+#---Brazil is an outlier. There might be sth wrong with it. 
+spotify %>% 
+    mutate (dummy = ifelse (country == "Brazil", "Brazil","Others")) %>% 
+    group_by (country) %>%  
+    distinct(id, .keep_all = TRUE) %>% 
+    pivot_longer(cols =  danceability:duration_ms, names_to = "metric", values_to = "value") %>% 
+ggplot (aes (value, fill = dummy, color = dummy)) +
+    geom_density (alpha = 0.7) +
+    facet_wrap(~ metric, scales = "free")
+#---At a glance it doesn't seem like there is sth wrong with Brazil's data so I'll keep it    
+    
+#--- A closer look to Indonesia (which is another outlier)
+spotify %>% 
+    mutate (dummy = ifelse (country == "Indonesia", "Indonesia","Others")) %>% 
+    group_by (country) %>%  
+    distinct(id, .keep_all = TRUE) %>% 
+    pivot_longer(cols =  danceability:duration_ms, names_to = "metric", values_to = "value") %>% 
+ggplot (aes (value, fill = dummy, color = dummy)) +
+    geom_density (alpha = 0.7) +
+    facet_wrap(~ metric, scales = "free")
+#---Same for iIndonesia
+
+```
+
+
+
+```{r}
+##### RIDGE PLOTS #####
+##### Some ridgeplots for key attributes
+library(ggridges)
+#--- Figure 5 in the paper ---#
+(valence <- 
+  spotify %>% 
+  ggplot(aes (valence,fct_reorder(country , valence)))+
+  geom_density_ridges_gradient(aes (fill = stat (x)),
+                               rel_min_height = 0.05,
+                               quantile_lines = TRUE,
+                               quantiles = 2,
+                               show.legend = FALSE) +
+  theme_ridges(font_family = "Times")+
+  scale_fill_viridis_c() +
+  labs (y = "",
+        title = "Figure 5. Valence Distribution across countries",
+        fill = "",
+         x = ""))
+  
+
+energy <- 
+  spotify %>% 
+  ggplot(aes (energy,fct_reorder(country , energy)))+
+  geom_density_ridges_gradient(aes (fill = stat (x)),
+                               rel_min_height = 0.05,
+                               quantile_lines = TRUE,
+                               quantiles = 2,
+                               show.legend = FALSE) +
+  theme_ridges(font_family = "Times")+
+  scale_fill_viridis_c() +
+  labs (y = "",
+        title = "Energy Distribution across countries",
+        fill = "",
+         x = "")
+
+
+
+```
+
+
+
